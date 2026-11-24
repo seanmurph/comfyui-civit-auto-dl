@@ -14,6 +14,7 @@ from typing import Any, Callable
 
 from .civitai import CivitAIClient, USER_AGENT
 from .config import ExtensionConfig, load_config
+from .huggingface import HuggingFaceClient, is_huggingface_url
 from .scanner import normalize_model_path, resolve_target_directory
 
 # Matches aria2c live status lines, e.g.:
@@ -107,14 +108,21 @@ def safe_join_target_path(base_dir: Path, relative_filename: str) -> Path:
     return target
 
 
+def _sanitize_error_text(text: str) -> str:
+    cleaned = re.sub(r"token=[^&\s]+", "token=***", text)
+    cleaned = re.sub(r"Bearer\s+\S+", "Bearer ***", cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+
 def build_aria2c_command(
     aria2c_bin: str,
     url: str,
     target_path: Path,
     cfg: ExtensionConfig,
+    headers: dict[str, str] | None = None,
 ) -> list[str]:
     """Build the aria2c command arguments for fast multi-connection downloads."""
-    return [
+    cmd = [
         aria2c_bin,
         f"--max-connection-per-server={cfg.aria2c_connections}",
         f"--split={cfg.aria2c_splits}",
@@ -126,10 +134,18 @@ def build_aria2c_command(
         "--summary-interval=1",
         "--console-log-level=notice",
         f"--user-agent={USER_AGENT}",
-        f"--dir={str(target_path.parent)}",
-        f"--out={target_path.name}",
-        url,
     ]
+    if headers:
+        for k, v in headers.items():
+            cmd.append(f"--header={k}: {v}")
+    cmd.extend(
+        [
+            f"--dir={str(target_path.parent)}",
+            f"--out={target_path.name}",
+            url,
+        ]
+    )
+    return cmd
 
 
 def check_aria2c(cfg: ExtensionConfig | None = None) -> dict[str, Any]:
@@ -257,6 +273,7 @@ class Aria2DownloadManager:
         version_id: int | None = None,
         model_name: str = "",
         preferred_domain: str = "",
+        source: str = "",
         cfg: ExtensionConfig | None = None,
     ) -> DownloadJob:
         """Queue a new aria2c download job and schedule its execution."""
@@ -300,6 +317,7 @@ class Aria2DownloadManager:
                 aria2c_bin=aria2_info["path"],
                 download_url=download_url,
                 preferred_domain=preferred_domain,
+                source=source,
                 cfg=cfg,
             )
         )
@@ -312,6 +330,7 @@ class Aria2DownloadManager:
         aria2c_bin: str,
         download_url: str,
         preferred_domain: str,
+        source: str,
         cfg: ExtensionConfig,
     ) -> None:
         sem = self._get_semaphore(cfg.aria2c_max_concurrent)
@@ -333,15 +352,25 @@ class Aria2DownloadManager:
                 job.status = "resolving"
                 self._emit(job)
 
-                client = CivitAIClient(
-                    api_key=cfg.effective_api_key(),
-                    domains=cfg.domains,
+                extra_headers: dict[str, str] = {}
+                is_hf = (
+                    source.lower() == "huggingface"
+                    or is_huggingface_url(download_url)
+                    or preferred_domain.lower() in ("huggingface.co", "hf.co")
                 )
-                resolved_url, used_domain = await client.resolve_download_url(
-                    download_url=download_url,
-                    version_id=job.version_id,
-                    preferred_domain=preferred_domain,
-                )
+                if is_hf:
+                    hf_client = HuggingFaceClient(token=cfg.effective_hf_token())
+                    resolved_url, used_domain, extra_headers = await hf_client.resolve_download_url(download_url)
+                else:
+                    client = CivitAIClient(
+                        api_key=cfg.effective_api_key(),
+                        domains=cfg.domains,
+                    )
+                    resolved_url, used_domain = await client.resolve_download_url(
+                        download_url=download_url,
+                        version_id=job.version_id,
+                        preferred_domain=preferred_domain,
+                    )
                 job.domain = used_domain
 
                 if job.status == "cancelled":
@@ -355,6 +384,7 @@ class Aria2DownloadManager:
                     url=resolved_url,
                     target_path=target_path,
                     cfg=cfg,
+                    headers=extra_headers,
                 )
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
@@ -388,8 +418,8 @@ class Aria2DownloadManager:
                             last_emit_ts = now
                             self._emit(job)
                     elif "ERROR" in line or "errorCode" in line or "Exception" in line:
-                        # Avoid leaking query tokens in error summaries
-                        sanitized = re.sub(r"token=[^&\s]+", "token=***", line)
+                        # Avoid leaking query/bearer tokens in error summaries
+                        sanitized = _sanitize_error_text(line)
                         last_error_lines.append(sanitized)
                         last_error_lines = last_error_lines[-3:]
 
@@ -425,7 +455,7 @@ class Aria2DownloadManager:
             job.status = "failed"
             job.speed = ""
             job.eta = ""
-            job.error = re.sub(r"token=[^&\s]+", "token=***", str(exc))
+            job.error = _sanitize_error_text(str(exc))
             self._emit(job)
         finally:
             self._procs.pop(job.job_id, None)

@@ -70,6 +70,7 @@ class CivitAICandidate:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "source": "civitai",
             "model_id": self.model_id,
             "version_id": self.version_id,
             "model_name": self.model_name,

@@ -1,6 +1,6 @@
 # ComfyUI-CivitAI-Missing-Models
 
-A ComfyUI custom node & frontend extension that **automatically detects missing models** in loaded workflows, searches **both CivitAI domains (`civitai.com` and `civitai.red`)**, and downloads them at maximum speed using **`aria2c`** directly into your ComfyUI model directories.
+A ComfyUI custom node & frontend extension that **automatically detects missing models** in loaded workflows, searches **CivitAI (`civitai.com` and `civitai.red`) and HuggingFace (`huggingface.co`)**, downloads them at maximum speed using **`aria2c`**, and lets you **upload local LoRAs/models directly from your browser** into `models/loras/` (or any model folder).
 
 ## Features
 
@@ -8,14 +8,18 @@ A ComfyUI custom node & frontend extension that **automatically detects missing 
   - Scans ComfyUI LiteGraph workflows (including nested subgraphs and `properties.models` metadata) and API prompt JSONs.
   - Supports standard loaders (`CheckpointLoaderSimple`, `LoraLoader`, `VAELoader`, `ControlNetLoader`, `CLIPLoader`, `DualCLIPLoader`, `UNETLoader`, `UnetLoaderGGUF`, `UpscaleModelLoader`, etc.), `rgthree` Power Lora Loader, and generic custom nodes referencing `.safetensors`, `.ckpt`, `.gguf`, `.pt`, `.pth`, `.bin`, `.onnx`, or `.sft` files.
   - Automatically scans when you load or drop a workflow and shows a toast + toolbar badge with the missing count.
-- **Dual-Domain CivitAI Search & Download (`civitai.com` + `civitai.red`)**:
-  - Queries both `https://civitai.com` and `https://civitai.red` concurrently, merges/deduplicates candidates, and tags which domain(s) host each model.
-  - Supports pasting a direct `civitai.com` or `civitai.red` URL (or custom search query) per missing model.
-  - Automatically falls back to the counterpart domain if a download is gated/unavailable on one domain.
+- **CivitAI (`.com` + `.red`) & HuggingFace Search + Download**:
+  - Clean segmented **Search Provider** toggle (`Both` | `CivitAI` | `HuggingFace`) right in the modal header.
+  - Queries `https://civitai.com`, `https://civitai.red`, and/or `https://huggingface.co`, merging and ranking candidates with clear domain badges.
+  - Direct URLs (`civitai.com/...`, `civitai.red/...`, `huggingface.co/...`, or `owner/repo` shorthand) automatically route to the matching provider regardless of the toggle.
+  - Supports both a **CivitAI API Key** (`CIVITAI_API_KEY` / `CAI_API_KEY`) and a **HuggingFace Access Token** (`HF_TOKEN` / `HUGGINGFACE_HUB_TOKEN`) for gated/NSFW/private repos, each with a built-in **Test** button in Settings.
 - **Fast Multi-Connection Downloads via `aria2c`**:
-  - Pre-resolves CivitAI redirects to the signed CDN URL so `aria2c` can saturate your connection with `-x 16 -s 16` without S3/R2 auth-header redirect errors.
+  - Pre-resolves CivitAI and HuggingFace redirects to signed CDN URLs so `aria2c` can saturate your connection with `-x 16 -s 16` without S3/R2/XetHub auth-header redirect errors.
   - Supports resumable downloads (`--continue=true`), concurrency limits, cancellation, and live progress bars (percentage, speed, active connections, ETA) streamed over ComfyUI's WebSocket.
-  - Automatically refreshes ComfyUI's model dropdowns when downloads complete.
+- **Browser LoRA / Model Upload (Chunked)**:
+  - Drag-and-drop or browse local `.safetensors` / `.ckpt` / `.gguf` files from your machine straight into `models/loras/` (with optional subfolder and folder selector, or click **Upload** right on any missing model card).
+  - Uploads in 4 MB chunks to bypass reverse-proxy body limits (RunPod/Vast.ai/Cloudflare) with live MB/s progress and cancel support.
+  - Automatically refreshes ComfyUI's model dropdowns when downloads or uploads complete.
 
 ## Installation
 

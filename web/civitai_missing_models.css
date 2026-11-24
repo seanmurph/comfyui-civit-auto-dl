@@ -446,3 +446,133 @@
   font-size: 12px;
   color: #8b949e;
 }
+
+.cmm-pill-hf {
+  border-color: rgba(255, 210, 30, 0.5);
+  background: rgba(255, 210, 30, 0.14);
+  color: #ffd21e;
+}
+
+.cmm-source-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 8px 18px;
+  background: #12171e;
+  border-bottom: 1px solid #30363d;
+  font-size: 12px;
+}
+
+.cmm-source-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cmm-source-label {
+  color: #8b949e;
+  font-weight: 600;
+}
+
+.cmm-segmented {
+  display: inline-flex;
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  padding: 2px;
+  gap: 2px;
+}
+
+.cmm-seg-btn {
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: #8b949e;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.cmm-seg-btn:hover {
+  color: #e6edf3;
+}
+
+.cmm-seg-btn.active {
+  background: #1f6feb;
+  color: #fff;
+}
+
+.cmm-seg-btn.active-hf {
+  background: #9e6a03;
+  color: #fff;
+}
+
+.cmm-source-hint {
+  color: #8b949e;
+  font-size: 11px;
+}
+
+.cmm-upload-panel {
+  padding: 14px 18px;
+  background: #0d1117;
+  border-bottom: 1px solid #30363d;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.cmm-upload-controls {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.cmm-dropzone {
+  border: 2px dashed #30363d;
+  border-radius: 10px;
+  padding: 18px 14px;
+  text-align: center;
+  background: #161b22;
+  color: #8b949e;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+  font-size: 13px;
+}
+
+.cmm-dropzone:hover,
+.cmm-dropzone.dragover {
+  border-color: #58a6ff;
+  background: rgba(56, 139, 253, 0.08);
+  color: #e6edf3;
+}
+
+.cmm-dropzone strong {
+  color: #e6edf3;
+}
+
+.cmm-upload-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cmm-upload-item {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #161b22;
+  border: 1px solid #30363d;
+}
+
+.cmm-btn-active {
+  border-color: #58a6ff;
+  background: rgba(56, 139, 253, 0.18);
+  color: #79c0ff;
+}

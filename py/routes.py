@@ -1,16 +1,131 @@
-"""ComfyUI PromptServer REST API routes for CivitAI Missing Models Downloader."""
+"""ComfyUI PromptServer REST API routes for CivitAI & HuggingFace Missing Models Downloader."""
 
 from __future__ import annotations
 
 import asyncio
 from typing import Any
 
-from .civitai import CivitAIClient
-from .config import load_config, update_config
+from .civitai import CivitAIClient, extract_civitai_ids
+from .config import ExtensionConfig, load_config, sanitize_search_source, update_config
 from .downloader import Aria2DownloadManager, check_aria2c
+from .huggingface import HuggingFaceClient, extract_hf_url_info
 from .scanner import scan_workflow
+from .uploader import ALLOWED_UPLOAD_FOLDERS, ChunkedUploadManager
 
 _ROUTES_REGISTERED = False
+
+
+def resolve_effective_search_source(
+    requested_source: str,
+    custom_query: str = "",
+    known_url: str = "",
+) -> str:
+    """Choose which provider(s) to query, auto-routing direct CivitAI or HuggingFace URLs."""
+    # Direct custom query URL/repo takes precedence over the toggle
+    if custom_query:
+        if any(extract_civitai_ids(custom_query)):
+            return "civitai"
+        if extract_hf_url_info(custom_query) is not None:
+            return "huggingface"
+
+    source = sanitize_search_source(requested_source, "both")
+
+    # If the workflow already embeds a known URL and user didn't pick a conflicting single source
+    if source == "both" and known_url and not custom_query:
+        if any(extract_civitai_ids(known_url)):
+            return "civitai"
+        if extract_hf_url_info(known_url) is not None:
+            return "huggingface"
+
+    return source
+
+
+async def search_across_sources(
+    cfg: ExtensionConfig,
+    filename: str,
+    folder: str = "checkpoints",
+    known_url: str = "",
+    custom_query: str = "",
+    source: str = "",
+    limit: int = 12,
+) -> dict[str, Any]:
+    """Query CivitAI, HuggingFace, or both concurrently and return merged ranked candidates."""
+    effective_source = resolve_effective_search_source(
+        requested_source=source or cfg.search_source,
+        custom_query=custom_query,
+        known_url=known_url,
+    )
+
+    tasks: list[tuple[str, Any]] = []
+    if effective_source in ("both", "civitai"):
+        civitai_client = CivitAIClient(api_key=cfg.effective_api_key(), domains=cfg.domains)
+        tasks.append(
+            (
+                "civitai",
+                civitai_client.search_missing_model(
+                    filename=filename,
+                    folder=folder,
+                    known_url=known_url,
+                    custom_query=custom_query,
+                    limit=limit,
+                ),
+            )
+        )
+    if effective_source in ("both", "huggingface"):
+        hf_client = HuggingFaceClient(token=cfg.effective_hf_token())
+        tasks.append(
+            (
+                "huggingface",
+                hf_client.search_missing_model(
+                    filename=filename,
+                    folder=folder,
+                    known_url=known_url,
+                    custom_query=custom_query,
+                    limit=limit,
+                ),
+            )
+        )
+
+    results = await asyncio.gather(*(coro for _, coro in tasks), return_exceptions=True)
+
+    candidates: list[dict[str, Any]] = []
+    domains_searched: list[str] = []
+    queries_tried: list[str] = []
+    errors: list[str] = []
+
+    for (provider, _), res in zip(tasks, results):
+        if isinstance(res, Exception):
+            errors.append(f"{provider}: {res}")
+            continue
+        if not isinstance(res, dict):
+            continue
+        for dom in res.get("domains_searched") or []:
+            if dom not in domains_searched:
+                domains_searched.append(dom)
+        for q in res.get("queries_tried") or []:
+            if q not in queries_tried:
+                queries_tried.append(q)
+        candidates.extend(res.get("candidates") or [])
+
+    # Sort combined candidates by match score, then preferring entries with known file size
+    candidates.sort(
+        key=lambda c: (float(c.get("score") or 0.0), int(c.get("size_bytes") or 0) > 0),
+        reverse=True,
+    )
+
+    payload: dict[str, Any] = {
+        "filename": filename,
+        "folder": folder,
+        "source": effective_source,
+        "domains_searched": domains_searched,
+        "queries_tried": queries_tried,
+        "candidates": candidates[:limit],
+    }
+    if errors and not candidates:
+        payload["error"] = "; ".join(errors)
+    elif errors:
+        payload["warnings"] = errors
+    return payload
 
 
 def register_routes() -> None:
@@ -32,6 +147,7 @@ def register_routes() -> None:
             pass
 
     manager = Aria2DownloadManager(on_update=broadcast_progress)
+    uploader = ChunkedUploadManager()
 
     @routes.get("/civitai-downloader/status")
     async def get_status(request: web.Request) -> web.Response:
@@ -44,6 +160,7 @@ def register_routes() -> None:
                 "aria2": aria2,
                 "config": cfg.to_public_dict(),
                 "active_downloads": active_count,
+                "upload_folders": list(ALLOWED_UPLOAD_FOLDERS),
             }
         )
 
@@ -83,6 +200,21 @@ def register_routes() -> None:
         result = await client.verify_api_key()
         return web.json_response(result)
 
+    @routes.post("/civitai-downloader/test-hf-token")
+    async def post_test_hf_token(request: web.Request) -> web.Response:
+        payload: dict[str, Any] = {}
+        try:
+            raw = await request.json()
+            if isinstance(raw, dict):
+                payload = raw
+        except Exception:
+            pass
+        cfg = load_config()
+        token_to_test = str(payload.get("hf_token") or "").strip() or cfg.effective_hf_token()
+        client = HuggingFaceClient(token=token_to_test)
+        result = await client.verify_token()
+        return web.json_response(result)
+
     @routes.post("/civitai-downloader/scan")
     async def post_scan(request: web.Request) -> web.Response:
         try:
@@ -103,7 +235,7 @@ def register_routes() -> None:
             return web.json_response({"error": "Expected JSON object"}, status=400)
 
         cfg = load_config()
-        client = CivitAIClient(api_key=cfg.effective_api_key(), domains=cfg.domains)
+        requested_source = str(payload.get("source") or cfg.search_source)
 
         # Support batch search (`items: [...]`) or single search (`filename: ...`)
         if isinstance(payload.get("items"), list):
@@ -116,13 +248,16 @@ def register_routes() -> None:
                     folder = str(item.get("folder") or "checkpoints")
                     known_url = str(item.get("known_url") or "")
                     custom_query = str(item.get("custom_query") or "")
+                    item_source = str(item.get("source") or requested_source)
                     item_id = str(item.get("id") or f"{folder}::{fname.lower()}")
                     try:
-                        res = await client.search_missing_model(
+                        res = await search_across_sources(
+                            cfg=cfg,
                             filename=fname,
                             folder=folder,
                             known_url=known_url,
                             custom_query=custom_query,
+                            source=item_source,
                         )
                         res["id"] = item_id
                         return res
@@ -146,11 +281,13 @@ def register_routes() -> None:
             return web.json_response({"error": "Provide filename, custom_query, or known_url"}, status=400)
 
         try:
-            result = await client.search_missing_model(
+            result = await search_across_sources(
+                cfg=cfg,
                 filename=filename,
                 folder=folder,
                 known_url=known_url,
                 custom_query=custom_query,
+                source=requested_source,
             )
             return web.json_response(result)
         except Exception as exc:
@@ -171,6 +308,7 @@ def register_routes() -> None:
         version_id = payload.get("version_id")
         model_name = str(payload.get("model_name") or "").strip()
         preferred_domain = str(payload.get("primary_domain") or payload.get("domain") or "").strip()
+        source = str(payload.get("source") or "").strip()
 
         if not filename:
             return web.json_response({"error": "Missing 'filename'"}, status=400)
@@ -190,6 +328,7 @@ def register_routes() -> None:
                 version_id=vid,
                 model_name=model_name,
                 preferred_domain=preferred_domain,
+                source=source,
             )
             return web.json_response({"job": job.to_dict()})
         except (RuntimeError, ValueError) as exc:
@@ -214,5 +353,78 @@ def register_routes() -> None:
         if not ok:
             return web.json_response({"error": "Job not found or still active"}, status=400)
         return web.json_response({"removed": job_id})
+
+    # Chunked browser upload endpoints (defaults to models/loras/)
+    @routes.post("/civitai-downloader/upload/init")
+    async def post_upload_init(request: web.Request) -> web.Response:
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+        if not isinstance(payload, dict):
+            return web.json_response({"error": "Expected JSON object"}, status=400)
+
+        try:
+            session = uploader.init_upload(
+                filename=str(payload.get("filename") or ""),
+                folder=str(payload.get("folder") or "loras"),
+                total_size=int(payload.get("total_size") or 0),
+                subfolder=str(payload.get("subfolder") or ""),
+                overwrite=bool(payload.get("overwrite", False)),
+            )
+            return web.json_response(session)
+        except FileExistsError as exc:
+            return web.json_response({"error": str(exc)}, status=409)
+        except (ValueError, RuntimeError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+    @routes.post("/civitai-downloader/upload/chunk")
+    async def post_upload_chunk(request: web.Request) -> web.Response:
+        upload_id = request.query.get("upload_id", "").strip()
+        offset_raw = request.query.get("offset", "0")
+        if not upload_id:
+            return web.json_response({"error": "Missing upload_id"}, status=400)
+        try:
+            offset = int(offset_raw)
+        except ValueError:
+            return web.json_response({"error": "Invalid offset"}, status=400)
+
+        data = await request.read()
+        try:
+            res = uploader.write_chunk(upload_id=upload_id, offset=offset, data=data)
+            return web.json_response(res)
+        except KeyError as exc:
+            return web.json_response({"error": str(exc)}, status=404)
+        except (ValueError, OSError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+    @routes.post("/civitai-downloader/upload/complete")
+    async def post_upload_complete(request: web.Request) -> web.Response:
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+        upload_id = str((payload or {}).get("upload_id") or "").strip()
+        if not upload_id:
+            return web.json_response({"error": "Missing upload_id"}, status=400)
+        try:
+            res = uploader.complete_upload(upload_id)
+            return web.json_response(res)
+        except KeyError as exc:
+            return web.json_response({"error": str(exc)}, status=404)
+        except FileExistsError as exc:
+            return web.json_response({"error": str(exc)}, status=409)
+        except (RuntimeError, OSError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+
+    @routes.post("/civitai-downloader/upload/cancel")
+    async def post_upload_cancel(request: web.Request) -> web.Response:
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+        upload_id = str((payload or {}).get("upload_id") or "").strip()
+        cancelled = uploader.cancel_upload(upload_id) if upload_id else False
+        return web.json_response({"cancelled": cancelled})
 
     _ROUTES_REGISTERED = True
