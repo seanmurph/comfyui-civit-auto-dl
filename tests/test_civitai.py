@@ -8,6 +8,7 @@ from py.civitai import (
     CivitAICandidate,
     build_search_queries,
     extract_civitai_ids,
+    infer_folder_from_civitai_type,
     merge_and_rank_candidates,
     score_candidate,
 )
@@ -101,6 +102,16 @@ class TestCivitAIClientHelpers(unittest.TestCase):
         self.assertEqual(merged[0].primary_domain, "civitai.red")
         self.assertTrue(merged[0].download_url.startswith("https://civitai.red/"))
         self.assertEqual(merged[0].preview_url, "https://image.civitai.com/preview.jpg")
+
+    def test_infer_folder_from_civitai_type(self) -> None:
+        self.assertEqual(infer_folder_from_civitai_type("LORA"), "loras")
+        self.assertEqual(infer_folder_from_civitai_type("LoCon"), "loras")
+        self.assertEqual(infer_folder_from_civitai_type("Checkpoint"), "checkpoints")
+        self.assertEqual(infer_folder_from_civitai_type("VAE"), "vae")
+        self.assertEqual(infer_folder_from_civitai_type("Controlnet"), "controlnet")
+        self.assertEqual(infer_folder_from_civitai_type("Upscaler"), "upscale_models")
+        self.assertEqual(infer_folder_from_civitai_type("TextualInversion"), "embeddings")
+        self.assertEqual(infer_folder_from_civitai_type("Other", "flux-q4_k_m.gguf"), "diffusion_models")
 
 
 if __name__ == "__main__":

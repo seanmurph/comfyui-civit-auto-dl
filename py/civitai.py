@@ -33,6 +33,35 @@ FOLDER_TO_CIVITAI_TYPES: dict[str, set[str]] = {
     "clip": {"Checkpoint", "Other"},
 }
 
+CIVITAI_TYPE_TO_FOLDER: dict[str, str] = {
+    "checkpoint": "checkpoints",
+    "lora": "loras",
+    "locon": "loras",
+    "dora": "loras",
+    "vae": "vae",
+    "controlnet": "controlnet",
+    "upscaler": "upscale_models",
+    "textualinversion": "embeddings",
+    "hypernetwork": "hypernetworks",
+}
+
+
+def infer_folder_from_civitai_type(model_type: str, filename: str = "") -> str:
+    """Map a CivitAI model type (Checkpoint, LORA, VAE, ...) to a ComfyUI models folder."""
+    mapped = CIVITAI_TYPE_TO_FOLDER.get((model_type or "").strip().lower())
+    if mapped:
+        return mapped
+    lower = (filename or "").lower()
+    if "lora" in lower:
+        return "loras"
+    if "vae" in lower:
+        return "vae"
+    if "controlnet" in lower:
+        return "controlnet"
+    if ".gguf" in lower:
+        return "diffusion_models"
+    return "checkpoints"
+
 CIVITAI_MODEL_URL_RE = re.compile(
     r"https?://(?:www\.)?civitai\.(?:com|red)/models/(\d+)(?:[^?#]*\?(?:[^#]*&)?modelVersionId=(\d+))?",
     re.IGNORECASE,
@@ -497,6 +526,59 @@ class CivitAIClient:
             "domains_searched": [domain_label(d) for d in self.domains],
             "queries_tried": queries_tried,
             "candidates": [c.to_dict() for c in ranked],
+        }
+
+    async def inspect_url(self, url: str, limit: int = 30) -> dict[str, Any]:
+        """Inspect a CivitAI model or download URL and list downloadable files."""
+        if aiohttp is None:
+            raise RuntimeError("aiohttp is required to query CivitAI API")
+        mid, vid = extract_civitai_ids(url)
+        if mid is None and vid is None:
+            raise ValueError("Not a recognized CivitAI model or download URL.")
+
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            candidates = await self._fetch_by_ids(
+                session=session,
+                model_id=mid,
+                version_id=vid,
+                target_filename="",
+                target_folder="",
+            )
+
+        # Deduplicate across .com and .red while keeping API version order (newest first)
+        deduped: list[CivitAICandidate] = []
+        seen: dict[tuple[int, str], CivitAICandidate] = {}
+        for cand in candidates:
+            key = (cand.version_id, cand.file_name.lower())
+            existing = seen.get(key)
+            if existing is None:
+                cand.match_reason = "CivitAI URL"
+                cand.score = 100.0
+                seen[key] = cand
+                deduped.append(cand)
+            else:
+                for d in cand.domains:
+                    if d not in existing.domains:
+                        existing.domains.append(d)
+                if not existing.preview_url and cand.preview_url:
+                    existing.preview_url = cand.preview_url
+                if existing.nsfw and "civitai.red" in existing.domains and existing.primary_domain != "civitai.red":
+                    existing.primary_domain = "civitai.red"
+                    existing.download_url = existing.download_url.replace("https://civitai.com", "https://civitai.red")
+                    existing.page_url = existing.page_url.replace("https://civitai.com", "https://civitai.red")
+
+        top = deduped[:limit]
+        suggested_folder = (
+            infer_folder_from_civitai_type(top[0].model_type, top[0].file_name)
+            if top
+            else "checkpoints"
+        )
+        return {
+            "url": url,
+            "source": "civitai",
+            "suggested_folder": suggested_folder,
+            "candidates": [c.to_dict() for c in top],
         }
 
     async def resolve_download_url(

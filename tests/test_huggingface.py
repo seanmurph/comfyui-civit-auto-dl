@@ -15,7 +15,7 @@ from py.huggingface import (
     is_huggingface_url,
     merge_and_rank_hf_candidates,
 )
-from py.routes import resolve_effective_search_source
+from py.routes import inspect_model_url, resolve_effective_search_source
 
 
 class TestHuggingFaceHelpers(unittest.TestCase):
@@ -134,6 +134,15 @@ class TestHuggingFaceHelpers(unittest.TestCase):
             headers={"Authorization": "Bearer hf_test"},
         )
         self.assertIn("--header=Authorization: Bearer hf_test", cmd)
+
+    def test_inspect_model_url_rejects_unrecognized_urls(self) -> None:
+        import asyncio
+
+        cfg = ExtensionConfig()
+        with self.assertRaises(ValueError):
+            asyncio.run(inspect_model_url(cfg, ""))
+        with self.assertRaises(ValueError):
+            asyncio.run(inspect_model_url(cfg, "https://example.com/some_file.safetensors"))
 
 
 if __name__ == "__main__":

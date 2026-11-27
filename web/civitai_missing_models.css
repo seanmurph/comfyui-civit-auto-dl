@@ -576,3 +576,31 @@
   background: rgba(56, 139, 253, 0.18);
   color: #79c0ff;
 }
+
+.cmm-url-panel {
+  padding: 14px 18px;
+  background: #0d1117;
+  border-bottom: 1px solid #30363d;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.cmm-url-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.cmm-url-row input[type="text"],
+.cmm-url-row input[type="url"] {
+  flex: 1;
+  min-width: 240px;
+}
+
+.cmm-manual-downloads {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}

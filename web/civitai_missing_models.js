@@ -48,8 +48,18 @@ class CivitAIMissingModelsUI {
     this.jobsByModelKey = new Map(); // `${folder}::${filename.toLowerCase()}` -> job
     this.jobsById = new Map(); // job_id -> job
     this.uploads = new Map(); // localId -> upload progress state
+    this.manualJobIds = new Set(); // job_ids started from the Download URL drawer
     this.settingsOpen = false;
     this.uploadOpen = false;
+    this.urlOpen = false;
+    this.urlInput = "";
+    this.urlFolder = "checkpoints";
+    this.urlSubfolder = "";
+    this.urlFilenameOverride = "";
+    this.urlLoading = false;
+    this.urlError = "";
+    this.urlCandidates = [];
+    this.urlSelectedIdx = 0;
     this.uploadFolder = "loras";
     this.uploadSubfolder = "";
     this.uploadOverwrite = false;
@@ -127,6 +137,7 @@ class CivitAIMissingModelsUI {
         <div style="display:flex;flex-direction:column;gap:8px;">
           <button type="button" class="cmm-btn cmm-btn-blue" data-sb="open">Open Missing Models Panel</button>
           <button type="button" class="cmm-btn cmm-btn-primary" data-sb="scan-search">Scan &amp; Search Models</button>
+          <button type="button" class="cmm-btn" data-sb="download-url">Download from URL</button>
           <button type="button" class="cmm-btn" data-sb="upload-lora">Upload Local LoRA</button>
           <button type="button" class="cmm-btn" data-sb="settings">API Keys &amp; Settings</button>
         </div>
@@ -153,6 +164,10 @@ class CivitAIMissingModelsUI {
 
     this.sidebarEl.querySelector('[data-sb="open"]')?.addEventListener("click", () => this.openModal());
     this.sidebarEl.querySelector('[data-sb="scan-search"]')?.addEventListener("click", () => this.openModal({ autoSearch: true }));
+    this.sidebarEl.querySelector('[data-sb="download-url"]')?.addEventListener("click", () => {
+      this.urlOpen = true;
+      this.openModal();
+    });
     this.sidebarEl.querySelector('[data-sb="upload-lora"]')?.addEventListener("click", () => {
       this.uploadOpen = true;
       this.uploadFolder = "loras";
@@ -254,27 +269,31 @@ class CivitAIMissingModelsUI {
     const modelKey = `${job.folder}::${String(job.filename || "").toLowerCase()}`;
     const escapedKey = CSS.escape(modelKey);
     const card = this.modalOverlay.querySelector(`.cmm-card[data-model-id="${escapedKey}"]`);
-    if (!card) return;
+    if (card) {
+      const slot = card.querySelector(`[data-progress-slot="${escapedKey}"]`);
+      if (slot) {
+        slot.innerHTML = this.renderProgressHtml(job);
+        const cancelBtn = slot.querySelector("[data-cancel-job]");
+        if (cancelBtn) {
+          cancelBtn.addEventListener("click", () => {
+            const jobId = cancelBtn.getAttribute("data-cancel-job");
+            if (jobId) this.cancelDownload(jobId);
+          });
+        }
+      }
 
-    const slot = card.querySelector(`[data-progress-slot="${escapedKey}"]`);
-    if (slot) {
-      slot.innerHTML = this.renderProgressHtml(job);
-      const cancelBtn = slot.querySelector("[data-cancel-job]");
-      if (cancelBtn) {
-        cancelBtn.addEventListener("click", () => {
-          const jobId = cancelBtn.getAttribute("data-cancel-job");
-          if (jobId) this.cancelDownload(jobId);
-        });
+      const dlBtn = card.querySelector(`[data-download="${escapedKey}"]`);
+      if (dlBtn) {
+        const aria2Available = Boolean(this.status?.aria2?.available);
+        const isDownloading = ["queued", "resolving", "downloading"].includes(job.status);
+        const isDone = job.status === "completed";
+        dlBtn.disabled = !aria2Available || isDownloading || isDone;
+        dlBtn.textContent = isDone ? "Downloaded" : isDownloading ? "Downloading..." : "Download (aria2)";
       }
     }
 
-    const dlBtn = card.querySelector(`[data-download="${escapedKey}"]`);
-    if (dlBtn) {
-      const aria2Available = Boolean(this.status?.aria2?.available);
-      const isDownloading = ["queued", "resolving", "downloading"].includes(job.status);
-      const isDone = job.status === "completed";
-      dlBtn.disabled = !aria2Available || isDownloading || isDone;
-      dlBtn.textContent = isDone ? "Downloaded" : isDownloading ? "Downloading..." : "Download (aria2)";
+    if (this.manualJobIds.has(job.job_id)) {
+      this.updateManualDownloadsInDom();
     }
   }
 
@@ -828,6 +847,222 @@ class CivitAIMissingModelsUI {
     }
   }
 
+  async inspectManualUrl(urlText) {
+    const cleaned = (urlText !== undefined ? urlText : this.urlInput || "").trim();
+    this.urlInput = cleaned;
+    if (!cleaned) {
+      this.urlError = "Paste a CivitAI (.com / .red) or HuggingFace URL first.";
+      this.urlCandidates = [];
+      this.renderModalContent();
+      return;
+    }
+
+    this.urlLoading = true;
+    this.urlError = "";
+    this.urlCandidates = [];
+    this.urlSelectedIdx = 0;
+    this.urlFilenameOverride = "";
+    this.renderModalContent();
+
+    try {
+      const res = await this.apiJson("/inspect-url", {
+        method: "POST",
+        body: JSON.stringify({ url: cleaned }),
+      });
+      this.urlLoading = false;
+      this.urlCandidates = res.candidates || [];
+      this.urlSelectedIdx = 0;
+      if (res.suggested_folder) {
+        this.urlFolder = res.suggested_folder;
+      }
+      if (this.urlCandidates.length > 0) {
+        this.urlFilenameOverride = this.urlCandidates[0].file_name || "";
+      } else {
+        this.urlError = "No downloadable model files found at that URL.";
+      }
+    } catch (err) {
+      this.urlLoading = false;
+      this.urlError = err.message || String(err);
+    }
+    this.renderModalContent();
+  }
+
+  async startManualUrlDownload() {
+    const cand = this.urlCandidates[this.urlSelectedIdx || 0];
+    if (!cand) return;
+
+    const chosenName = (this.urlFilenameOverride || cand.file_name || "").trim();
+    if (!chosenName) {
+      alert("Please enter a target filename.");
+      return;
+    }
+
+    try {
+      const res = await this.apiJson("/download", {
+        method: "POST",
+        body: JSON.stringify({
+          filename: chosenName,
+          subfolder: this.urlSubfolder || "",
+          folder: this.urlFolder || "checkpoints",
+          download_url: cand.download_url,
+          version_id: cand.version_id,
+          model_name: cand.model_name,
+          primary_domain: cand.primary_domain,
+          source: cand.source || "",
+        }),
+      });
+      if (res.job) {
+        this.recordJob(res.job);
+        this.manualJobIds.add(res.job.job_id);
+        this.updateManualDownloadsInDom();
+      }
+    } catch (err) {
+      alert(`Download failed to start: ${err.message}`);
+    }
+  }
+
+  renderManualDownloadsHtml() {
+    const jobs = Array.from(this.manualJobIds)
+      .map((id) => this.jobsById.get(id))
+      .filter(Boolean)
+      .sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+    if (!jobs.length) return "";
+    return jobs
+      .map(
+        (job) => `
+          <div class="cmm-upload-item">
+            <div class="cmm-progress-meta">
+              <span>
+                <strong>${escapeHtml(job.filename)}</strong>
+                <span class="cmm-pill" style="margin-left:4px;">models/${escapeHtml(job.folder)}/</span>
+              </span>
+            </div>
+            ${this.renderProgressHtml(job)}
+          </div>
+        `
+      )
+      .join("");
+  }
+
+  updateManualDownloadsInDom() {
+    if (!this.modalOverlay) return;
+    const container = this.modalOverlay.querySelector("[data-manual-downloads]");
+    if (!container) return;
+    container.innerHTML = this.renderManualDownloadsHtml();
+    container.querySelectorAll("[data-cancel-job]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const jobId = btn.getAttribute("data-cancel-job");
+        if (jobId) this.cancelDownload(jobId);
+      });
+    });
+  }
+
+  renderUrlPanelHtml(uploadFolders, aria2Available) {
+    const cand = this.urlCandidates[this.urlSelectedIdx || 0];
+    let previewHtml = "";
+
+    if (this.urlLoading) {
+      previewHtml = `<div class="cmm-candidate-sub">Inspecting URL...</div>`;
+    } else if (this.urlError) {
+      previewHtml = `<div class="cmm-pill cmm-pill-red">${escapeHtml(this.urlError)}</div>`;
+    } else if (cand) {
+      const domainBadges = (cand.domains || [cand.primary_domain])
+        .map((d) => {
+          const cls = d.includes("huggingface")
+            ? "cmm-pill-hf"
+            : d.includes(".red")
+            ? "cmm-pill-red"
+            : "cmm-pill-blue";
+          return `<span class="cmm-pill ${cls}">${escapeHtml(d)}</span>`;
+        })
+        .join("");
+
+      const selectorHtml =
+        this.urlCandidates.length > 1
+          ? `<select class="cmm-select" data-url-select-cand>
+              ${this.urlCandidates
+                .map(
+                  (c, idx) =>
+                    `<option value="${idx}" ${idx === this.urlSelectedIdx ? "selected" : ""}>
+                      ${escapeHtml(c.file_name)}${c.version_name ? ` — ${escapeHtml(c.version_name)}` : ""} (${formatBytes(c.size_bytes)})
+                    </option>`
+                )
+                .join("")}
+            </select>`
+          : "";
+
+      previewHtml = `
+        ${selectorHtml}
+        <div class="cmm-candidate">
+          ${cand.preview_url ? `<img class="cmm-thumb" src="${escapeHtml(cand.preview_url)}" alt="" loading="lazy" />` : ""}
+          <div class="cmm-candidate-info">
+            <a class="cmm-candidate-title" href="${escapeHtml(cand.page_url)}" target="_blank" rel="noopener noreferrer">
+              ${escapeHtml(cand.model_name)}${cand.version_name ? ` &mdash; ${escapeHtml(cand.version_name)}` : ""}
+            </a>
+            <div class="cmm-candidate-sub">
+              <span>${escapeHtml(cand.file_name)}</span>
+              <span>&bull; ${formatBytes(cand.size_bytes)}</span>
+              ${cand.base_model ? `<span class="cmm-pill">${escapeHtml(cand.base_model)}</span>` : ""}
+              ${domainBadges}
+              ${cand.nsfw ? `<span class="cmm-pill cmm-pill-red">NSFW</span>` : ""}
+              ${cand.gated ? `<span class="cmm-pill cmm-pill-warn">Gated</span>` : ""}
+            </div>
+          </div>
+          <div>
+            <button
+              type="button"
+              class="cmm-btn cmm-btn-primary"
+              data-act="start-url-download"
+              ${aria2Available ? "" : "disabled"}
+            >
+              Download to models/${escapeHtml(this.urlFolder)}/
+            </button>
+          </div>
+        </div>
+      `;
+    }
+
+    return `
+      <div class="cmm-url-panel" data-url-panel>
+        <div class="cmm-url-row">
+          <input
+            class="cmm-input"
+            type="text"
+            data-manual-url-input
+            value="${escapeHtml(this.urlInput)}"
+            placeholder="Paste CivitAI (.com / .red) or HuggingFace URL (or owner/repo)..."
+          />
+          <button type="button" class="cmm-btn cmm-btn-blue" data-act="inspect-url" ${this.urlLoading ? "disabled" : ""}>
+            ${this.urlLoading ? "Inspecting..." : "Inspect URL"}
+          </button>
+        </div>
+        <div class="cmm-upload-controls">
+          <div class="cmm-field" style="min-width:170px;">
+            <label>Target ComfyUI Folder</label>
+            <select class="cmm-select" data-url-folder>
+              ${uploadFolders
+                .map(
+                  (f) =>
+                    `<option value="${escapeHtml(f)}" ${f === this.urlFolder ? "selected" : ""}>models/${escapeHtml(f)}/</option>`
+                )
+                .join("")}
+            </select>
+          </div>
+          <div class="cmm-field" style="flex:1;min-width:140px;">
+            <label>Subfolder (optional)</label>
+            <input class="cmm-input" type="text" data-url-subfolder value="${escapeHtml(this.urlSubfolder)}" placeholder="e.g. flux or sdxl" />
+          </div>
+          <div class="cmm-field" style="flex:1;min-width:180px;">
+            <label>Filename (auto-filled after Inspect)</label>
+            <input class="cmm-input" type="text" data-url-filename value="${escapeHtml(this.urlFilenameOverride)}" placeholder="model.safetensors" />
+          </div>
+        </div>
+        ${previewHtml}
+        <div class="cmm-manual-downloads" data-manual-downloads>${this.renderManualDownloadsHtml()}</div>
+      </div>
+    `;
+  }
+
   async syncNativeSetting(partialConfig) {
     try {
       const res = await this.apiJson("/config", {
@@ -921,6 +1156,7 @@ class CivitAIMissingModelsUI {
           <button type="button" class="cmm-btn cmm-btn-primary" data-act="download-all" ${matchedCount && aria2.available ? "" : "disabled"}>
             Download All (${matchedCount})
           </button>
+          <button type="button" class="cmm-btn ${this.urlOpen ? "cmm-btn-active" : ""}" data-act="toggle-url">Download URL</button>
           <button type="button" class="cmm-btn ${this.uploadOpen ? "cmm-btn-active" : ""}" data-act="toggle-upload">Upload LoRA</button>
           <button type="button" class="cmm-btn ${this.settingsOpen ? "cmm-btn-active" : ""}" data-act="toggle-settings">Settings</button>
           <button type="button" class="cmm-btn" data-act="close">&times;</button>
@@ -955,6 +1191,8 @@ class CivitAIMissingModelsUI {
             </div>`
           : ""
       }
+
+      ${this.urlOpen ? this.renderUrlPanelHtml(uploadFolders, aria2.available) : ""}
 
       ${
         this.uploadOpen
@@ -1207,6 +1445,10 @@ class CivitAIMissingModelsUI {
     modal.querySelector('[data-act="rescan"]')?.addEventListener("click", () => this.scanCurrentWorkflow());
     modal.querySelector('[data-act="search-all"]')?.addEventListener("click", () => this.searchAll());
     modal.querySelector('[data-act="download-all"]')?.addEventListener("click", () => this.downloadAllMatched());
+    modal.querySelector('[data-act="toggle-url"]')?.addEventListener("click", () => {
+      this.urlOpen = !this.urlOpen;
+      this.renderModalContent();
+    });
     modal.querySelector('[data-act="toggle-upload"]')?.addEventListener("click", () => {
       this.uploadOpen = !this.uploadOpen;
       this.renderModalContent();
@@ -1235,6 +1477,58 @@ class CivitAIMissingModelsUI {
         const src = btn.getAttribute("data-set-source");
         if (src) this.setSearchSource(src);
       });
+    });
+
+    // Manual URL download panel controls
+    const manualUrlInput = modal.querySelector("[data-manual-url-input]");
+    const urlFolderSel = modal.querySelector("[data-url-folder]");
+    const urlSubInput = modal.querySelector("[data-url-subfolder]");
+    const urlFilenameInput = modal.querySelector("[data-url-filename]");
+    const urlCandSel = modal.querySelector("[data-url-select-cand]");
+
+    if (manualUrlInput) {
+      manualUrlInput.addEventListener("input", () => {
+        this.urlInput = manualUrlInput.value;
+      });
+      manualUrlInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          this.inspectManualUrl(manualUrlInput.value);
+        }
+      });
+    }
+    modal.querySelector('[data-act="inspect-url"]')?.addEventListener("click", () => {
+      this.inspectManualUrl(manualUrlInput ? manualUrlInput.value : this.urlInput);
+    });
+    if (urlFolderSel) {
+      urlFolderSel.addEventListener("change", () => {
+        this.urlFolder = urlFolderSel.value || "checkpoints";
+        const dlBtn = modal.querySelector('[data-act="start-url-download"]');
+        if (dlBtn) dlBtn.textContent = `Download to models/${this.urlFolder}/`;
+      });
+    }
+    if (urlSubInput) {
+      urlSubInput.addEventListener("input", () => {
+        this.urlSubfolder = urlSubInput.value.trim();
+      });
+    }
+    if (urlFilenameInput) {
+      urlFilenameInput.addEventListener("input", () => {
+        this.urlFilenameOverride = urlFilenameInput.value;
+      });
+    }
+    if (urlCandSel) {
+      urlCandSel.addEventListener("change", () => {
+        this.urlSelectedIdx = Number(urlCandSel.value) || 0;
+        const chosen = this.urlCandidates[this.urlSelectedIdx];
+        if (chosen) {
+          this.urlFilenameOverride = chosen.file_name || "";
+        }
+        this.renderModalContent();
+      });
+    }
+    modal.querySelector('[data-act="start-url-download"]')?.addEventListener("click", () => {
+      this.startManualUrlDownload();
     });
 
     // Upload panel controls
@@ -1387,6 +1681,15 @@ app.registerExtension({
       function: () => ui.openModal({ autoSearch: true }),
     },
     {
+      id: "CivitAI.MissingModels.DownloadUrl",
+      label: "Download Model from URL (CivitAI / HuggingFace)",
+      icon: "pi pi-link",
+      function: () => {
+        ui.urlOpen = true;
+        ui.openModal();
+      },
+    },
+    {
       id: "CivitAI.MissingModels.UploadLora",
       label: "Upload Local LoRA to models/loras/",
       icon: "pi pi-upload",
@@ -1403,6 +1706,7 @@ app.registerExtension({
       commands: [
         "CivitAI.MissingModels.Open",
         "CivitAI.MissingModels.ScanAndSearch",
+        "CivitAI.MissingModels.DownloadUrl",
         "CivitAI.MissingModels.UploadLora",
       ],
     },

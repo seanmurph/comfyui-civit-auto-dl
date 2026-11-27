@@ -9,7 +9,7 @@ from .civitai import CivitAIClient, extract_civitai_ids
 from .config import ExtensionConfig, load_config, sanitize_search_source, update_config
 from .downloader import Aria2DownloadManager, check_aria2c
 from .huggingface import HuggingFaceClient, extract_hf_url_info
-from .scanner import scan_workflow
+from .scanner import normalize_model_path, scan_workflow
 from .uploader import ALLOWED_UPLOAD_FOLDERS, ChunkedUploadManager
 
 _ROUTES_REGISTERED = False
@@ -126,6 +126,25 @@ async def search_across_sources(
     elif errors:
         payload["warnings"] = errors
     return payload
+
+
+async def inspect_model_url(cfg: ExtensionConfig, url: str) -> dict[str, Any]:
+    """Inspect a manually supplied CivitAI or HuggingFace URL and return candidate files + suggested folder."""
+    cleaned = (url or "").strip()
+    if not cleaned:
+        raise ValueError("Please provide a CivitAI or HuggingFace URL.")
+
+    if any(extract_civitai_ids(cleaned)):
+        client = CivitAIClient(api_key=cfg.effective_api_key(), domains=cfg.domains)
+        return await client.inspect_url(cleaned)
+
+    if extract_hf_url_info(cleaned) is not None:
+        hf_client = HuggingFaceClient(token=cfg.effective_hf_token())
+        return await hf_client.inspect_url(cleaned)
+
+    raise ValueError(
+        "Unrecognized URL. Paste a CivitAI URL (civitai.com / civitai.red) or a HuggingFace URL (huggingface.co/... or owner/repo)."
+    )
 
 
 def register_routes() -> None:
@@ -293,6 +312,28 @@ def register_routes() -> None:
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=500)
 
+    @routes.post("/civitai-downloader/inspect-url")
+    async def post_inspect_url(request: web.Request) -> web.Response:
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON body"}, status=400)
+        if not isinstance(payload, dict):
+            return web.json_response({"error": "Expected JSON object"}, status=400)
+
+        url = str(payload.get("url") or "").strip()
+        if not url:
+            return web.json_response({"error": "Missing 'url'"}, status=400)
+
+        cfg = load_config()
+        try:
+            result = await inspect_model_url(cfg, url)
+            return web.json_response(result)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+
     @routes.post("/civitai-downloader/download")
     async def post_download(request: web.Request) -> web.Response:
         try:
@@ -303,6 +344,7 @@ def register_routes() -> None:
             return web.json_response({"error": "Expected JSON object"}, status=400)
 
         filename = str(payload.get("filename") or "").strip()
+        subfolder = normalize_model_path(str(payload.get("subfolder") or "")).strip("/")
         folder = str(payload.get("folder") or "checkpoints").strip()
         download_url = str(payload.get("download_url") or "").strip()
         version_id = payload.get("version_id")
@@ -315,6 +357,9 @@ def register_routes() -> None:
         if not download_url and not version_id:
             return web.json_response({"error": "Provide 'download_url' or 'version_id'"}, status=400)
 
+        clean_name = normalize_model_path(filename).lstrip("/")
+        rel_filename = f"{subfolder}/{clean_name}" if subfolder else clean_name
+
         try:
             vid = int(version_id) if version_id is not None else None
         except (TypeError, ValueError):
@@ -322,7 +367,7 @@ def register_routes() -> None:
 
         try:
             job = manager.start_download(
-                filename=filename,
+                filename=rel_filename,
                 folder=folder,
                 download_url=download_url,
                 version_id=vid,

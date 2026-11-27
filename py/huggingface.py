@@ -15,7 +15,7 @@ except ImportError:
     aiohttp = None  # type: ignore
 
 from .civitai import USER_AGENT, build_search_queries, score_candidate
-from .scanner import MODEL_EXTENSIONS
+from .scanner import MODEL_EXTENSIONS, infer_folder_from_context
 
 HF_BASE_URL = "https://huggingface.co"
 HF_HOSTS = {"huggingface.co", "www.huggingface.co", "hf.co", "www.hf.co"}
@@ -431,6 +431,76 @@ class HuggingFaceClient:
             "domains_searched": ["huggingface.co"],
             "queries_tried": queries_tried,
             "candidates": [c.to_dict() for c in ranked],
+        }
+
+    async def inspect_url(self, url: str, limit: int = 40) -> dict[str, Any]:
+        """Inspect a HuggingFace file URL, repo URL, or `owner/repo` shorthand."""
+        if aiohttp is None:
+            raise RuntimeError("aiohttp is required to query HuggingFace API")
+        info = extract_hf_url_info(url)
+        if info is None:
+            raise ValueError("Not a recognized HuggingFace URL or owner/repo identifier.")
+
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        candidates: list[HuggingFaceCandidate] = []
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            repo_data = await self._fetch_repo_blobs(session, info.repo_id)
+            if info.file_path:
+                dl_url, page_url = _build_hf_urls(info.repo_id, info.revision, info.file_path)
+                size_bytes = 0
+                gated = False
+                base_model = ""
+                if repo_data:
+                    gated = bool(repo_data.get("gated", False))
+                    base_model = _infer_base_model_from_tags(repo_data.get("tags") or [])
+                    for sib in repo_data.get("siblings") or []:
+                        if isinstance(sib, dict) and sib.get("rfilename") == info.file_path:
+                            lfs = sib.get("lfs") if isinstance(sib.get("lfs"), dict) else {}
+                            size_bytes = int(sib.get("size") or lfs.get("size") or 0)
+                            break
+                candidates.append(
+                    HuggingFaceCandidate(
+                        repo_id=info.repo_id,
+                        file_path=info.file_path,
+                        file_name=os.path.basename(info.file_path),
+                        revision=info.revision,
+                        size_bytes=size_bytes,
+                        download_url=dl_url,
+                        page_url=page_url,
+                        base_model=base_model,
+                        gated=gated,
+                        score=100.0,
+                        match_reason="Direct HuggingFace URL",
+                    )
+                )
+            elif repo_data:
+                extracted = _extract_candidates_from_repo(
+                    repo_data,
+                    target_filename="",
+                    target_folder="",
+                    revision=info.revision,
+                )
+                for c in extracted:
+                    c.score = 100.0
+                    c.match_reason = "HuggingFace Repo"
+                # Prefer larger / safetensors files first so primary weights appear at top
+                extracted.sort(
+                    key=lambda c: (c.file_name.lower().endswith(".safetensors"), c.size_bytes),
+                    reverse=True,
+                )
+                candidates = extracted[:limit]
+
+        suggested_folder = (
+            infer_folder_from_context(info.repo_id, "", candidates[0].file_path)
+            if candidates
+            else infer_folder_from_context(info.repo_id, "", "")
+        )
+        return {
+            "url": url,
+            "source": "huggingface",
+            "suggested_folder": suggested_folder,
+            "candidates": [c.to_dict() for c in candidates],
         }
 
     async def resolve_download_url(self, download_url: str) -> tuple[str, str, dict[str, str]]:
